@@ -1841,21 +1841,31 @@ class ScanTask:
 
 @dataclass(init=False)
 class FileScanTask(ScanTask):
-    """Task representing a data file and its corresponding delete files."""
+    """Task representing a data file (or sub-file byte range) and its corresponding delete files.
+
+    When start and length are None, the task represents the entire file (default).
+    When set, they define a byte range covering one or more row groups for sub-file reads.
+    """
 
     file: DataFile
     delete_files: set[DataFile]
     residual: BooleanExpression
+    start: int | None
+    length: int | None
 
     def __init__(
         self,
         data_file: DataFile,
         delete_files: set[DataFile] | None = None,
         residual: BooleanExpression = ALWAYS_TRUE,
+        start: int | None = None,
+        length: int | None = None,
     ) -> None:
         self.file = data_file
         self.delete_files = delete_files or set()
         self.residual = residual
+        self.start = start
+        self.length = length
 
     @staticmethod
     def from_rest_response(
