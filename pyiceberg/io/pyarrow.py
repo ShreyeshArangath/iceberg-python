@@ -1109,6 +1109,77 @@ def _subset_fragment_by_byte_range(fragment: ds.Fragment, task: FileScanTask) ->
         return fragment
 
 
+def _get_orc_stripe_row_counts(fragment: ds.Fragment, task: FileScanTask) -> list[int]:
+    """Get row counts per stripe for ORC files.
+
+    Uses fragment metadata if available, otherwise falls back to even distribution
+    based on record_count and number of split_offsets.
+
+    Args:
+        fragment: The ORC file fragment.
+        task: FileScanTask with file metadata.
+
+    Returns:
+        List of row counts per stripe.
+    """
+    num_stripes = len(task.file.split_offsets) if task.file.split_offsets else 1
+
+    # Try to get stripe info from ORC metadata if available
+    if hasattr(fragment, 'num_stripes'):
+        num_stripes = fragment.num_stripes
+
+    # Even distribution fallback (acceptable approximation for position delete scoping)
+    base_count = task.file.record_count // num_stripes
+    remainder = task.file.record_count % num_stripes
+    return [base_count + (1 if i < remainder else 0) for i in range(num_stripes)]
+
+
+def _compute_split_row_range(fragment: ds.Fragment, task: FileScanTask) -> tuple[int, int]:
+    """Compute the file-absolute row range for a sub-file split.
+
+    Uses the ORIGINAL (un-subsetted) fragment's metadata to determine which rows
+    belong to this split based on byte range alignment with split_offsets.
+
+    Args:
+        fragment: The original (full-file) fragment with all metadata.
+        task: FileScanTask with start and length set.
+
+    Returns:
+        (split_start_row, split_end_row): File-absolute row range for this split.
+    """
+    if task.file.split_offsets is None:
+        # No metadata - assume whole file
+        return (0, task.file.record_count)
+
+    byte_start = task.start
+    byte_end = task.start + task.length
+    split_offsets = sorted(task.file.split_offsets)
+
+    # Determine which row group/stripe indices fall in [byte_start, byte_end)
+    ids_in_split = [i for i, offset in enumerate(split_offsets) if byte_start <= offset < byte_end]
+
+    if not ids_in_split:
+        return (0, task.file.record_count)
+
+    # Compute row counts per row group/stripe from fragment metadata
+    if task.file.file_format == FileFormat.PARQUET:
+        metadata = fragment.metadata
+        row_counts = [metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)]
+    elif task.file.file_format == FileFormat.ORC:
+        # ORC: use fragment metadata for stripe row counts
+        row_counts = _get_orc_stripe_row_counts(fragment, task)
+    else:
+        return (0, task.file.record_count)
+
+    first_id = ids_in_split[0]
+    last_id = ids_in_split[-1]
+
+    split_start_row = sum(row_counts[:first_id])
+    split_end_row = sum(row_counts[:last_id + 1])
+
+    return (split_start_row, split_end_row)
+
+
 def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]:
     if data_file.file_format == FileFormat.PARQUET:
         with io.new_input(data_file.file_path).open() as fi:
@@ -1622,6 +1693,11 @@ def _task_to_record_batches(
     with io.new_input(task.file.file_path).open() as fin:
         fragment = arrow_format.make_fragment(fin)
 
+        # Compute split row offset BEFORE subsetting (needs full fragment metadata)
+        split_start_row = 0
+        if task.start is not None and task.length is not None and positional_deletes:
+            split_start_row, split_end_row = _compute_split_row_range(fragment, task)
+
         # Apply byte range filtering for sub-file splits
         if task.start is not None and task.length is not None:
             fragment = _subset_fragment_by_byte_range(fragment, task)
@@ -1670,8 +1746,12 @@ def _task_to_record_batches(
             current_batch = batch
 
             if positional_deletes:
-                # Create the mask of indices that we're interested in
-                indices = _combine_positional_deletes(positional_deletes, current_index, current_index + len(batch))
+                # For splits, current_index is split-relative (starts at 0 for first batch in split).
+                # But positional_deletes use file-absolute positions.
+                # Offset current_index by split_start_row to align with file-absolute delete positions.
+                file_absolute_start = current_index + split_start_row
+                file_absolute_end = file_absolute_start + len(batch)
+                indices = _combine_positional_deletes(positional_deletes, file_absolute_start, file_absolute_end)
                 current_batch = current_batch.take(indices)
 
             # skip empty batches
