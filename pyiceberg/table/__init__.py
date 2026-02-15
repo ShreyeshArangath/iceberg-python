@@ -57,6 +57,7 @@ from pyiceberg.io import FileIO, load_file_io
 from pyiceberg.manifest import (
     DataFile,
     DataFileContent,
+    FileFormat,
     ManifestContent,
     ManifestEntry,
     ManifestFile,
@@ -1903,6 +1904,59 @@ class FileScanTask(ScanTask):
         )
 
 
+def _split_file_scan_task(task: FileScanTask, target_split_size: int) -> Iterable[FileScanTask]:
+    """Split a FileScanTask at row group/stripe boundaries using greedy bin-packing.
+
+    Args:
+        task: The FileScanTask to split.
+        target_split_size: Target byte size for each split.
+
+    Yields:
+        FileScanTask instances with start/length populated for splits, or
+        the original whole-file task when splitting is not possible.
+    """
+    # Guard: no split metadata available
+    if task.file.split_offsets is None:
+        yield task
+        return
+
+    # Guard: file too small to split
+    if task.file.file_size_in_bytes < target_split_size:
+        yield task
+        return
+
+    # Guard: unsupported format
+    if task.file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
+        yield task
+        return
+
+    # Sort split_offsets defensively (should already be sorted but ensure)
+    split_offsets = sorted(task.file.split_offsets)
+
+    # Greedy bin-packing over sorted offsets
+    current_start = 0
+    for offset in split_offsets:
+        # When accumulated size >= target, emit a split
+        if offset - current_start >= target_split_size:
+            yield FileScanTask(
+                data_file=task.file,
+                delete_files=task.delete_files,
+                residual=task.residual,
+                start=current_start,
+                length=offset - current_start,
+            )
+            current_start = offset
+
+    # Emit final split covering current_start to end of file
+    yield FileScanTask(
+        data_file=task.file,
+        delete_files=task.delete_files,
+        residual=task.residual,
+        start=current_start,
+        length=task.file.file_size_in_bytes - current_start,
+    )
+
+
 def _rest_file_to_data_file(rest_file: RESTContentFile) -> DataFile:
     """Convert a REST content file to a manifest DataFile."""
     from pyiceberg.catalog.rest.scan_planning import RESTDataFile
@@ -2152,6 +2206,25 @@ class DataScan(TableScan):
         if self._should_use_server_side_planning():
             return self._plan_files_server_side()
         return self._plan_files_local()
+
+
+    def plan_splits(self, target_split_size: int = 128 * 1024 * 1024) -> Iterable[FileScanTask]:
+        """Plan file scan tasks split at row group/stripe boundaries.
+
+        Splits large Parquet and ORC files into smaller tasks targeting the specified
+        byte size. Tasks align to row group (Parquet) or stripe (ORC) boundaries.
+        Falls back to whole-file tasks when split metadata is unavailable or file is
+        smaller than target.
+
+        Args:
+            target_split_size: Target byte size for each split (default 128 MB)
+
+        Yields:
+            FileScanTask instances with start/length populated for splits, or
+            original whole-file tasks when splitting is not possible.
+        """
+        for task in self.plan_files():
+            yield from _split_file_scan_task(task, target_split_size)
 
     def to_arrow(self) -> pa.Table:
         """Read an Arrow table eagerly from this DataScan.
