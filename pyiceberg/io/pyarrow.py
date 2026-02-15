@@ -1073,6 +1073,42 @@ def _get_file_format(file_format: FileFormat, **kwargs: dict[str, Any]) -> ds.Fi
         raise ValueError(f"Unsupported file format: {file_format}")
 
 
+def _subset_fragment_by_byte_range(fragment: ds.Fragment, task: FileScanTask) -> ds.Fragment:
+    """Subset a fragment to only the row groups/stripes within the task's byte range.
+
+    Maps the byte range [task.start, task.start + task.length) to row group/stripe
+    indices using split_offsets, then calls fragment.subset() to filter.
+
+    Args:
+        fragment: The PyArrow dataset fragment for the file.
+        task: FileScanTask with start and length set.
+
+    Returns:
+        A subsetted fragment reading only the relevant row groups/stripes.
+    """
+    if task.file.split_offsets is None:
+        return fragment  # No metadata to compute IDs - read whole file
+
+    byte_start = task.start
+    byte_end = task.start + task.length
+    split_offsets = sorted(task.file.split_offsets)
+
+    # Each split_offset[i] marks the start byte of row group/stripe i.
+    # A row group/stripe i is within the byte range if its start offset >= byte_start
+    # and < byte_end.
+    ids = [i for i, offset in enumerate(split_offsets) if byte_start <= offset < byte_end]
+
+    if not ids:
+        return fragment  # Fallback to full read if no IDs matched
+
+    if task.file.file_format == FileFormat.PARQUET:
+        return fragment.subset(row_group_ids=ids)
+    elif task.file.file_format == FileFormat.ORC:
+        return fragment.subset(stripe_ids=ids)
+    else:
+        return fragment
+
+
 def _read_deletes(io: FileIO, data_file: DataFile) -> dict[str, pa.ChunkedArray]:
     if data_file.file_format == FileFormat.PARQUET:
         with io.new_input(data_file.file_path).open() as fi:
@@ -1585,6 +1621,11 @@ def _task_to_record_batches(
     arrow_format = _get_file_format(task.file.file_format, pre_buffer=True, buffer_size=(ONE_MEGABYTE * 8))
     with io.new_input(task.file.file_path).open() as fin:
         fragment = arrow_format.make_fragment(fin)
+
+        # Apply byte range filtering for sub-file splits
+        if task.start is not None and task.length is not None:
+            fragment = _subset_fragment_by_byte_range(fragment, task)
+
         physical_schema = fragment.physical_schema
 
         # For V1 and V2, we only support Timestamp 'us' in Iceberg Schema,
