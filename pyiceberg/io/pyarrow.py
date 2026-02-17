@@ -1074,18 +1074,7 @@ def _get_file_format(file_format: FileFormat, **kwargs: dict[str, Any]) -> ds.Fi
 
 
 def _subset_fragment_by_byte_range(fragment: ds.Fragment, task: FileScanTask) -> ds.Fragment:
-    """Subset a fragment to only the row groups/stripes within the task's byte range.
-
-    Maps the byte range [task.start, task.start + task.length) to row group/stripe
-    indices using split_offsets, then calls fragment.subset() to filter.
-
-    Args:
-        fragment: The PyArrow dataset fragment for the file.
-        task: FileScanTask with start and length set.
-
-    Returns:
-        A subsetted fragment reading only the relevant row groups/stripes.
-    """
+    """Subset fragment to row groups/stripes within the byte range using split_offsets."""
     if task.file.split_offsets is None:
         return fragment  # No metadata to compute IDs - read whole file
 
@@ -1093,13 +1082,13 @@ def _subset_fragment_by_byte_range(fragment: ds.Fragment, task: FileScanTask) ->
     byte_end = task.start + task.length
     split_offsets = sorted(task.file.split_offsets)
 
-    # Each split_offset[i] marks the start byte of row group/stripe i.
-    # A row group/stripe i is within the byte range if its start offset >= byte_start
-    # and < byte_end.
     ids = [i for i, offset in enumerate(split_offsets) if byte_start <= offset < byte_end]
 
     if not ids:
-        return fragment  # Fallback to full read if no IDs matched
+        raise ValueError(
+            f"No row groups/stripes found in byte range [{byte_start}, {byte_end}). "
+            f"Split offsets: {split_offsets}"
+        )
 
     if task.file.file_format == FileFormat.PARQUET:
         return fragment.subset(row_group_ids=ids)
@@ -1128,7 +1117,7 @@ def _get_orc_stripe_row_counts(fragment: ds.Fragment, task: FileScanTask) -> lis
     if hasattr(fragment, 'num_stripes'):
         num_stripes = fragment.num_stripes
 
-    # Even distribution fallback (acceptable approximation for position delete scoping)
+    # Even distribution fallback
     base_count = task.file.record_count // num_stripes
     remainder = task.file.record_count % num_stripes
     return [base_count + (1 if i < remainder else 0) for i in range(num_stripes)]
@@ -1159,7 +1148,10 @@ def _compute_split_row_range(fragment: ds.Fragment, task: FileScanTask) -> tuple
     ids_in_split = [i for i, offset in enumerate(split_offsets) if byte_start <= offset < byte_end]
 
     if not ids_in_split:
-        return (0, task.file.record_count)
+        raise ValueError(
+            f"No row groups/stripes found in byte range [{byte_start}, {byte_end}). "
+            f"Split offsets: {split_offsets}"
+        )
 
     # Compute row counts per row group/stripe from fragment metadata
     if task.file.file_format == FileFormat.PARQUET:
@@ -1693,7 +1685,7 @@ def _task_to_record_batches(
     with io.new_input(task.file.file_path).open() as fin:
         fragment = arrow_format.make_fragment(fin)
 
-        # Compute split row offset BEFORE subsetting (needs full fragment metadata)
+        # Compute row range from full fragment metadata before subsetting
         split_start_row = 0
         if task.start is not None and task.length is not None and positional_deletes:
             split_start_row, split_end_row = _compute_split_row_range(fragment, task)
@@ -1746,9 +1738,7 @@ def _task_to_record_batches(
             current_batch = batch
 
             if positional_deletes:
-                # For splits, current_index is split-relative (starts at 0 for first batch in split).
-                # But positional_deletes use file-absolute positions.
-                # Offset current_index by split_start_row to align with file-absolute delete positions.
+                # Convert split-relative batch positions to file-absolute for position deletes
                 file_absolute_start = current_index + split_start_row
                 file_absolute_end = file_absolute_start + len(batch)
                 indices = _combine_positional_deletes(positional_deletes, file_absolute_start, file_absolute_end)

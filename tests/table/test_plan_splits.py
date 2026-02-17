@@ -240,22 +240,6 @@ def test_split_file_coverage():
         assert curr_split.start == prev_split.start + prev_split.length
 
 
-def test_split_file_empty_split_offsets():
-    """Test _split_file_scan_task with empty split_offsets list yields whole-file task."""
-    data_file = _make_data_file(
-        split_offsets=[],
-    )
-    task = FileScanTask(data_file=data_file)
-
-    splits = list(_split_file_scan_task(task, target_split_size=128 * 1024 * 1024))
-
-    # Empty split_offsets means no row group metadata, should return whole file
-    # Greedy algorithm will yield one split covering [0, file_size)
-    assert len(splits) == 1
-    assert splits[0].start == 0
-    assert splits[0].length == data_file.file_size_in_bytes
-
-
 def test_split_file_unsorted_offsets():
     """Test _split_file_scan_task handles unsorted split_offsets correctly."""
     MB_128 = 128 * 1024 * 1024

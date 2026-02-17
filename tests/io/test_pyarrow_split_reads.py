@@ -180,35 +180,6 @@ def test_subset_fragment_multiple_row_groups_in_range():
     assert result == subsetted_fragment
 
 
-def test_subset_fragment_empty_id_list_fallback():
-    """Test fallback to full read when no row groups match byte range."""
-    # This edge case: byte range doesn't align with any split offset
-    # In practice this shouldn't happen with proper planning, but test defensive behavior
-    task = FileScanTask(
-        data_file=DataFile.from_args(
-            content=1,
-            file_path="/test.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=1000,
-            file_size_in_bytes=256 * 1024 * 1024,
-            split_offsets=[0, 128 * 1024 * 1024, 256 * 1024 * 1024],
-        ),
-        delete_files=set(),
-        start=64 * 1024 * 1024,  # Between offsets 0 and 128MB
-        length=32 * 1024 * 1024,  # Ends before 128MB
-    )
-
-    fragment = Mock()
-    fragment.subset = Mock()
-
-    result = _subset_fragment_by_byte_range(fragment, task)
-
-    # Should return original fragment without calling subset (fallback)
-    fragment.subset.assert_not_called()
-    assert result == fragment
-
-
 def test_subset_fragment_unsorted_split_offsets():
     """Test that function handles unsorted split_offsets by sorting them."""
     # split_offsets may not be guaranteed sorted in metadata

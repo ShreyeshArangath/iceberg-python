@@ -1907,30 +1907,21 @@ class FileScanTask(ScanTask):
 def _split_file_scan_task(task: FileScanTask, target_split_size: int) -> Iterable[FileScanTask]:
     """Split a FileScanTask at row group/stripe boundaries using greedy bin-packing.
 
-    Args:
-        task: The FileScanTask to split.
-        target_split_size: Target byte size for each split.
-
-    Yields:
-        FileScanTask instances with start/length populated for splits, or
-        the original whole-file task when splitting is not possible.
+    Yields FileScanTask instances with start/length set, or the original task if splitting
+    is not possible (no metadata, file too small, unsupported format).
     """
-    # Guard: no split metadata available
-    if task.file.split_offsets is None:
+    if task.file.split_offsets is None or len(task.file.split_offsets) == 0:
         yield task
         return
 
-    # Guard: file too small to split
     if task.file.file_size_in_bytes < target_split_size:
         yield task
         return
 
-    # Guard: unsupported format
     if task.file.file_format not in (FileFormat.PARQUET, FileFormat.ORC):
         yield task
         return
 
-    # Sort split_offsets defensively (should already be sorted but ensure)
     split_offsets = sorted(task.file.split_offsets)
 
     # Greedy bin-packing over sorted offsets
@@ -2209,19 +2200,13 @@ class DataScan(TableScan):
 
 
     def plan_splits(self, target_split_size: int = 128 * 1024 * 1024) -> Iterable[FileScanTask]:
-        """Plan file scan tasks split at row group/stripe boundaries.
-
-        Splits large Parquet and ORC files into smaller tasks targeting the specified
-        byte size. Tasks align to row group (Parquet) or stripe (ORC) boundaries.
-        Falls back to whole-file tasks when split metadata is unavailable or file is
-        smaller than target.
+        """Split files at row group/stripe boundaries for parallel reading.
 
         Args:
-            target_split_size: Target byte size for each split (default 128 MB)
+            target_split_size: Target bytes per split (default 128 MB)
 
         Yields:
-            FileScanTask instances with start/length populated for splits, or
-            original whole-file tasks when splitting is not possible.
+            FileScanTask instances with byte ranges, or whole-file tasks when not splittable.
         """
         for task in self.plan_files():
             yield from _split_file_scan_task(task, target_split_size)

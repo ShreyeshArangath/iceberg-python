@@ -137,22 +137,6 @@ def test_compute_split_row_range_no_split_offsets():
     assert split_end == 1500
 
 
-def test_compute_split_row_range_empty_ids():
-    """Test that no matching IDs returns whole-file range."""
-    fragment = Mock()
-    task = Mock()
-    task.file.split_offsets = [0, 100_000_000, 200_000_000]
-    task.file.file_format = FileFormat.PARQUET
-    task.file.record_count = 1500
-    task.start = 500_000_000  # Way beyond file
-    task.length = 100_000_000
-
-    split_start, split_end = _compute_split_row_range(fragment, task)
-
-    assert split_start == 0
-    assert split_end == 1500
-
-
 def test_compute_split_row_range_orc():
     """Test split row range computation for ORC files using even distribution."""
     fragment = Mock(spec=ds.OrcFileFragment)
